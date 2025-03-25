@@ -1,344 +1,490 @@
-# polytope.py
-
 import numpy as np
-from typing import List, Tuple, Optional, Union
-import polytope as pc 
-
-from .AxisSet import AxisSet
+from scipy.optimize import linprog
+from scipy.spatial import ConvexHull
+import warnings
+from typing import List, Tuple, Optional, Union, Set
 
 
 class Polytope:
     """
-    Extended polytope class for reachability analysis.
-    
-    This class extends the functionality of the base polytope package
-    with additional operations needed for distributed reachability.
+    A class representing a polytope in the form Ax <= b.
+    Designed for operations related to distributed backward reachability for linear affine systems.
     """
     
-    def __init__(self, polytope: pc.Polytope):
+    def __init__(self, A: np.ndarray, b: np.ndarray, tol: float = 1e-10):
         """
-        Initialize with a base polytope.
+        Initialize a polytope with its constraint matrices.
         
-        Args:
-            polytope: Base polytope object
+        Parameters:
+        -----------
+        A : numpy.ndarray
+            Coefficient matrix of shape (num_constraints, dimension)
+        b : numpy.ndarray
+            Right-hand side vector of shape (num_constraints,)
+        tol : float, optional
+            Numerical tolerance for various operations
         """
-        self.polytope = polytope
+        if A.shape[0] != b.shape[0]:
+            raise ValueError(f"Dimensions mismatch: A has {A.shape[0]} rows, b has {b.shape[0]} elements")
+        
+        # Remove redundant constraints to simplify the representation
+        self.A, self.b = self._remove_redundant_constraints(A, b)
+        self.dim = self.A.shape[1]  # Dimension of the space
+        self.tol = tol
     
-    @classmethod
-    def from_hyperplanes(cls, A: np.ndarray, b: np.ndarray) -> 'Polytope':
+    def _remove_redundant_constraints(self, A: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Create a polytope from hyperplane representation (Ax <= b).
+        Remove redundant constraints from the polytope representation.
         
-        Args:
-            A: Matrix of hyperplane normals
-            b: Vector of hyperplane offsets
+        This function identifies and removes constraints that are redundant (implied by other constraints).
+        For linear affine systems, this helps keep the representation minimal which speeds up projections.
+        
+        Returns:
+        --------
+        Tuple[numpy.ndarray, numpy.ndarray]
+            Simplified A matrix and b vector
+        """
+        if A.shape[0] == 0:  # Empty constraint set
+            return A, b
+            
+        non_redundant_rows = []
+        for i in range(A.shape[0]):
+            # Create a linear program to check if constraint i is redundant
+            # Maximize A[i]·x - b[i] subject to all other constraints
+            c = -A[i]  # Negative because we're maximizing
+            A_others = np.delete(A, i, axis=0)
+            b_others = np.delete(b, i)
+            
+            # We need to handle potential infeasibility
+            try:
+                # Use the simplex method as it's more robust for this task
+                result = linprog(c, A_ub=A_others, b_ub=b_others, method='highs')
+                
+                # If the solution's negative objective value is less than -b[i] - tol, constraint i is not redundant
+                # Note: LP maximizes -A[i]·x, so result.fun is -max(A[i]·x)
+                if result.success and -result.fun <= b[i] + self.tol:
+                    # Constraint i is redundant (implied by other constraints)
+                    continue
+                non_redundant_rows.append(i)
+            except:
+                # If the LP fails, conservatively keep the constraint
+                non_redundant_rows.append(i)
+        
+        # Return the non-redundant constraints
+        if non_redundant_rows:
+            return A[non_redundant_rows], b[non_redundant_rows]
+        # If all constraints are redundant, the polytope is unbounded - return an empty constraint set
+        return np.zeros((0, A.shape[1])), np.zeros(0)
+    
+    def is_empty(self) -> bool:
+        """
+        Check if the polytope is empty (has no feasible points).
+        
+        Returns:
+        --------
+        bool
+            True if the polytope is empty, False otherwise
+        """
+        if self.A.shape[0] == 0:
+            return False  # No constraints means the polytope is the entire space
+            
+        # Create a linear program to find any feasible point
+        # We minimize a dummy objective (zeros) just to get a feasible point
+        c = np.zeros(self.dim)
+        try:
+            result = linprog(c, A_ub=self.A, b_ub=self.b, method='highs')
+            return not result.success
+        except:
+            # If the LP solver fails, conservatively say the polytope is not empty
+            warnings.warn("LP solver failed to determine if polytope is empty")
+            return False
+    
+    def contains(self, point: np.ndarray, tol: Optional[float] = None) -> bool:
+        """
+        Check if a point is contained in the polytope.
+        
+        Parameters:
+        -----------
+        point : numpy.ndarray
+            The point to check, shape (dimension,)
+        tol : float, optional
+            Tolerance for numerical comparisons, defaults to self.tol
             
         Returns:
-            Polytope instance
+        --------
+        bool
+            True if the point is in the polytope, False otherwise
         """
-        return cls(pc.Polytope(A, b))
+        if tol is None:
+            tol = self.tol
+            
+        if len(point) != self.dim:
+            raise ValueError(f"Point dimension {len(point)} does not match polytope dimension {self.dim}")
+            
+        # Check if all constraints are satisfied: Ax <= b
+        return np.all(self.A @ point <= self.b + tol)
     
-    @classmethod
-    def from_vertices(cls, vertices: np.ndarray) -> 'Polytope':
+    def project(self, axis_set: Set[int]) -> 'Polytope':
         """
-        Create a polytope from vertex representation.
+        Project the polytope onto the subspace defined by the given axes.
         
-        Args:
-            vertices: Array where each row is a vertex
+        Parameters:
+        -----------
+        axis_set : Set[int]
+            Set of coordinate indices to project onto (0-indexed)
             
         Returns:
-            Polytope instance
+        --------
+        Polytope
+            The projected polytope
         """
-        # The polytope package may have different ways to construct from vertices
-        # This is a common approach, but check the documentation of your chosen package
-        return cls(pc.qhull(vertices))
-    
-    def project(self, from_axes: AxisSet, to_axes: AxisSet) -> 'Polytope':
-        """
-        Project the polytope from a higher-dimensional space to a lower-dimensional space.
-        
-        This implementation is optimized for linear affine systems and uses Fourier-Motzkin
-        elimination for efficient projection computation.
-        
-        Args:
-            from_axes: Original axis set
-            to_axes: Target axis set (must be a subset of from_axes)
+        if not axis_set:
+            return Polytope(np.zeros((0, 0)), np.zeros(0))
             
-        Returns:
-            Projected polytope
-        """
-        if not all(axis in from_axes.indices for axis in to_axes.indices):
-            raise ValueError("Target axes must be a subset of original axes")
-        
-        # Get the H-representation (Ax <= b) of the polytope
-        A, b = self.get_constraints()
-        
-        # If the polytope is empty, return an empty polytope
-        if self.is_empty():
-            return Polytope.from_hyperplanes(np.zeros((0, len(to_axes))), np.zeros(0))
-        
-        # Create mapping from original dimensions to projected dimensions
-        projection_indices = []
-        elimination_indices = []
-        
-        # Identify which indices to keep and which to eliminate
-        for i, axis in enumerate(from_axes.indices):
-            if axis in to_axes.indices:
-                projection_indices.append(i)
-            else:
-                elimination_indices.append(i)
-        
-        # If no dimensions to eliminate, just extract the relevant coordinates
-        if not elimination_indices:
-            A_proj = A[:, projection_indices]
-            return Polytope.from_hyperplanes(A_proj, b)
-        
-        # Apply Fourier-Motzkin elimination for each dimension to eliminate
-        A_current, b_current = A, b
-        
-        for elim_idx in elimination_indices:
-            # Adjust index to account for already eliminated dimensions
-            adjusted_idx = elim_idx
-            for prev_idx in elimination_indices:
-                if prev_idx < elim_idx and prev_idx not in projection_indices:
-                    adjusted_idx -= 1
+        if max(axis_set) >= self.dim or min(axis_set) < 0:
+            raise ValueError(f"Invalid axis indices in {axis_set}, must be between 0 and {self.dim-1}")
             
-            # Separate constraints into those with positive, negative, and zero coefficients
-            # for the dimension being eliminated
-            pos_rows = np.where(A_current[:, adjusted_idx] > 0)[0]
-            neg_rows = np.where(A_current[:, adjusted_idx] < 0)[0]
-            zero_rows = np.where(A_current[:, adjusted_idx] == 0)[0]
+        # For projection, we use Fourier-Motzkin elimination to project out variables not in axis_set
+        # This is efficient for linear affine systems
+        
+        # Get the indices to eliminate
+        to_eliminate = set(range(self.dim)) - set(axis_set)
+        
+        # Start with the current polytope
+        A_proj = self.A.copy()
+        b_proj = self.b.copy()
+        
+        # Eliminate variables one by one
+        for var_idx in sorted(to_eliminate, reverse=True):
+            # Partition constraints based on coefficient sign for the variable to eliminate
+            pos_rows = np.where(A_proj[:, var_idx] > self.tol)[0]
+            neg_rows = np.where(A_proj[:, var_idx] < -self.tol)[0]
+            zero_rows = np.where(np.abs(A_proj[:, var_idx]) <= self.tol)[0]
             
-            # Initialize new arrays for the projected constraints
-            num_new_constraints = len(pos_rows) * len(neg_rows) + len(zero_rows)
-            A_new = np.zeros((num_new_constraints, A_current.shape[1] - 1))
-            b_new = np.zeros(num_new_constraints)
+            # Create new constraints by combining positive and negative constraints
+            new_constraints = []
+            new_rhs = []
             
-            # Keep constraints where the coefficient is zero
-            constraint_idx = 0
-            for i in zero_rows:
-                A_new[constraint_idx, :adjusted_idx] = A_current[i, :adjusted_idx]
-                A_new[constraint_idx, adjusted_idx:] = A_current[i, (adjusted_idx+1):]
-                b_new[constraint_idx] = b_current[i]
-                constraint_idx += 1
+            # Keep constraints not involving this variable
+            if len(zero_rows) > 0:
+                new_constraints.append(A_proj[zero_rows])
+                new_rhs.append(b_proj[zero_rows])
             
             # Combine positive and negative constraints to eliminate the variable
             for i in pos_rows:
                 for j in neg_rows:
-                    # Normalize constraints so the coefficients of the eliminated variable are 1 and -1
-                    alpha = A_current[i, adjusted_idx]
-                    beta = -A_current[j, adjusted_idx]
+                    # Scale constraints so the coefficients for var_idx cancel out
+                    scale_i = -A_proj[j, var_idx]
+                    scale_j = A_proj[i, var_idx]
                     
-                    # Combine constraints: alpha * (row_j) + beta * (row_i)
-                    A_new[constraint_idx, :adjusted_idx] = (beta * A_current[i, :adjusted_idx] + 
-                                                        alpha * A_current[j, :adjusted_idx])
-                    A_new[constraint_idx, adjusted_idx:] = (beta * A_current[i, (adjusted_idx+1):] + 
-                                                        alpha * A_current[j, (adjusted_idx+1):])
-                    b_new[constraint_idx] = beta * b_current[i] + alpha * b_current[j]
-                    constraint_idx += 1
+                    # Combine the constraints
+                    new_constraint = scale_i * A_proj[i] + scale_j * A_proj[j]
+                    new_right_hand = scale_i * b_proj[i] + scale_j * b_proj[j]
+                    
+                    # Skip if the constraint becomes numerically unstable
+                    if np.any(np.abs(new_constraint) > 1e10):
+                        continue
+                    
+                    new_constraints.append(new_constraint.reshape(1, -1))
+                    new_rhs.append(np.array([new_right_hand]))
             
-            # Update for the next iteration
-            A_current = A_new
-            b_current = b_new
+            # Combine all new constraints
+            if new_constraints:
+                A_proj = np.vstack(new_constraints)
+                b_proj = np.concatenate(new_rhs)
+            else:
+                # If no constraints left, the projection is the entire space
+                return Polytope(np.zeros((0, len(axis_set))), np.zeros(0))
         
-        # Remove redundant constraints if possible
-        # This is optional but can significantly reduce the number of constraints
-        A_current, b_current = self._remove_redundant_constraints(A_current, b_current)
-        
-        return Polytope.from_hyperplanes(A_current, b_current)
-
-    def _remove_redundant_constraints(self, A: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        # Extract columns corresponding to kept variables and create the projected polytope
+        kept_cols = sorted(axis_set)
+        A_final = A_proj[:, kept_cols]
+        return Polytope(A_final, b_proj)
+    
+    def extrude(self, axis_set: Set[int], full_space_dim: int) -> 'Polytope':
         """
-        Remove redundant constraints from the H-representation of a polytope.
+        Extrude the polytope into a higher dimensional space.
         
-        Args:
-            A: Matrix of constraint coefficients
-            b: Vector of constraint constants
+        Parameters:
+        -----------
+        axis_set : Set[int]
+            Set of coordinate indices that the polytope lives in (0-indexed)
+        full_space_dim : int
+            Dimension of the full space to extrude into
             
         Returns:
-            Tuple of (A, b) with redundant constraints removed
+        --------
+        Polytope
+            The extruded polytope
         """
-        # Simple implementation: check each constraint by solving an LP
-        # For each constraint, maximize its violation subject to all other constraints
-        # If the maximum violation is <= 0, the constraint is redundant
-        
-        if A.shape[0] == 0:
-            return A, b
-        
-        non_redundant = []
-        
-        for i in range(A.shape[0]):
-            # Create the constraints without the current one
-            A_others = np.delete(A, i, axis=0)
-            b_others = np.delete(b, i)
+        if not axis_set:
+            # Empty axis set means the polytope is unconstrained in all dimensions
+            return Polytope(np.zeros((0, full_space_dim)), np.zeros(0))
             
-            # Set up the LP to maximize violation of constraint i
-            # Maximize c^T x subject to A_others x <= b_others
-            # where c = A[i] (we're maximizing the left side of A[i] x <= b[i])
-            c = A[i]
+        if max(axis_set) >= full_space_dim or min(axis_set) < 0:
+            raise ValueError(f"Invalid axis indices in {axis_set}, must be between 0 and {full_space_dim-1}")
             
-            # Use scipy's linprog to solve the LP
-            # We negate c because linprog minimizes by default
-            from scipy.optimize import linprog
-            res = linprog(-c, A_eq=None, b_eq=None, A_ub=A_others, b_ub=b_others, 
-                        bounds=None, method='highs')
-            
-            # If the problem is infeasible, keep the constraint (degenerate case)
-            # If the optimal value <= b[i], the constraint is redundant
-            if not res.success or (-res.fun > b[i]):
-                non_redundant.append(i)
+        if len(axis_set) != self.dim:
+            raise ValueError(f"Axis set size {len(axis_set)} doesn't match polytope dimension {self.dim}")
         
-        return A[non_redundant], b[non_redundant]
+        # Create a mapping from original indices to the indices in the full space
+        axis_list = sorted(axis_set)
+        
+        # Create the new constraint matrix
+        A_extruded = np.zeros((self.A.shape[0], full_space_dim))
+        
+        # Map constraints from the original space to the full space
+        for i, orig_idx in enumerate(axis_list):
+            A_extruded[:, orig_idx] = self.A[:, i]
+        
+        return Polytope(A_extruded, self.b)
     
-    def extrude(self, from_axes: AxisSet, to_axes: AxisSet) -> 'Polytope':
+    def intersection(self, other: 'Polytope') -> 'Polytope':
         """
-        Extrude the polytope from a lower-dimensional space to a higher-dimensional space.
+        Compute the intersection of this polytope with another.
         
-        This method extends a polytope by adding dimensions where constraints are unbounded.
-        For linear affine systems, this is crucial for the distributed reachability algorithm.
-        
-        Args:
-            from_axes: Original axis set (lower dimension)
-            to_axes: Target axis set (higher dimension, must include from_axes)
+        Parameters:
+        -----------
+        other : Polytope
+            Another polytope to intersect with
             
         Returns:
-            Extruded polytope in the higher-dimensional space
+        --------
+        Polytope
+            The intersection polytope
         """
-        if not all(axis in to_axes.indices for axis in from_axes.indices):
-            raise ValueError("Original axes must be a subset of target axes")
+        if self.dim != other.dim:
+            raise ValueError(f"Cannot intersect polytopes of different dimensions: {self.dim} and {other.dim}")
         
-        # Get the H-representation (Ax <= b) of the original polytope
-        A_orig, b_orig = self.get_constraints()
+        # Intersect by simply stacking the constraints
+        A_combined = np.vstack((self.A, other.A))
+        b_combined = np.concatenate((self.b, other.b))
         
-        # If the original polytope is empty, return an empty polytope in the target dimension
-        if self.is_empty():
-            return Polytope.from_hyperplanes(np.zeros((0, len(to_axes))), np.zeros(0))
-        
-        # Create mapping from original dimensions to target dimensions
-        axis_mapping = {}
-        for i, axis in enumerate(from_axes.indices):
-            to_idx = to_axes.indices.index(axis)
-            axis_mapping[i] = to_idx
-        
-        # Create the new constraint matrix for the higher-dimensional space
-        A_new = np.zeros((A_orig.shape[0], len(to_axes)))
-        
-        # Map constraints to the appropriate dimensions
-        for i in range(A_orig.shape[0]):
-            for j in range(A_orig.shape[1]):
-                if j in axis_mapping:
-                    A_new[i, axis_mapping[j]] = A_orig[i, j]
-        
-        # The b vector remains unchanged
-        b_new = b_orig.copy()
-        
-        # Add constraints to bound the polytope in the new dimensions if needed
-        # This is optional and depends on the specific application
-        # For distributed reachability, we typically want unbounded extrusion
-        
-        return Polytope.from_hyperplanes(A_new, b_new)
+        return Polytope(A_combined, b_combined)
     
-    def intersect(self, other: 'Polytope') -> 'Polytope':
+    def get_chebyshev_center(self) -> Optional[np.ndarray]:
         """
-        Compute the intersection with another polytope.
+        Find the Chebyshev center of the polytope - the center of the largest inscribed ball.
+        This is useful for finding a "central" point inside the polytope.
         
-        Args:
-            other: Another polytope
+        Returns:
+        --------
+        numpy.ndarray or None
+            The Chebyshev center if the polytope is bounded, None otherwise
+        """
+        if self.A.shape[0] == 0:
+            # If no constraints, polytope is unbounded
+            return None
+            
+        # Normalize rows of A to have unit norm
+        row_norms = np.linalg.norm(self.A, axis=1)
+        A_normalized = self.A / row_norms[:, np.newaxis]
+        b_normalized = self.b / row_norms
+        
+        # Set up LP to maximize the radius of the inscribed ball
+        # Variables: [x_1, ..., x_n, r] where r is the radius
+        c = np.zeros(self.dim + 1)
+        c[-1] = -1  # Maximize r
+        
+        # Constraints: a_i · x + r||a_i|| ≤ b_i  for all i
+        A_lp = np.hstack((A_normalized, np.ones((A_normalized.shape[0], 1))))
+        
+        try:
+            result = linprog(c, A_ub=A_lp, b_ub=b_normalized, method='highs')
+            if result.success:
+                return result.x[:-1]  # Return the center (exclude the radius)
+            return None
+        except:
+            # If LP fails, try a simpler approach
+            warnings.warn("Chebyshev center computation failed, returning a feasible point instead")
+            return self._find_feasible_point()
+    
+    def _find_feasible_point(self) -> Optional[np.ndarray]:
+        """
+        Find any feasible point inside the polytope.
+        
+        Returns:
+        --------
+        numpy.ndarray or None
+            A feasible point if one exists, None otherwise
+        """
+        c = np.zeros(self.dim)  # We don't care about optimization, just feasibility
+        try:
+            result = linprog(c, A_ub=self.A, b_ub=self.b, method='highs')
+            if result.success:
+                return result.x
+            return None
+        except:
+            return None
+    
+    def get_vertices(self, max_vertices: int = 1000) -> Optional[np.ndarray]:
+        """
+        Compute the vertices of the polytope using a vertex enumeration algorithm.
+        
+        Parameters:
+        -----------
+        max_vertices : int, optional
+            Maximum number of vertices to compute before giving up (for efficiency)
             
         Returns:
-            Intersection polytope
+        --------
+        numpy.ndarray or None
+            Array of shape (num_vertices, dimension) containing the vertices,
+            or None if the polytope is unbounded or has too many vertices
         """
-        intersection = pc.intersect(self.polytope, other.polytope)
-        return Polytope(intersection)
-    
-    @staticmethod
-    def intersect_many(polytopes: List['Polytope']) -> 'Polytope':
-        """
-        Compute the intersection of multiple polytopes.
-        
-        Args:
-            polytopes: List of polytopes to intersect
+        if self.A.shape[0] == 0:
+            return None  # Unbounded polytope
             
-        Returns:
-            Intersection polytope
-        """
-        if not polytopes:
-            raise ValueError("Empty list of polytopes")
+        # For high-dimensional polytopes, this can be computationally expensive
+        # So we'll implement a simple approach using linear programming
         
-        result = polytopes[0]
-        for poly in polytopes[1:]:
-            result = result.intersect(poly)
+        # First, check if the polytope is bounded
+        for i in range(self.dim):
+            # Check if we can make coordinate i arbitrarily large positive
+            c = np.zeros(self.dim)
+            c[i] = 1
+            result = linprog(-c, A_ub=self.A, b_ub=self.b, method='highs')
+            if not result.success:
+                return None  # Polytope is unbounded
         
-        return result
+        # Now, compute vertices via the "vertex enumeration" approach
+        vertices = []
+        
+        # Generate a set of random objective directions
+        np.random.seed(42)  # For reproducibility
+        num_directions = min(max_vertices, self.dim * 10)
+        directions = np.random.randn(num_directions, self.dim)
+        directions /= np.linalg.norm(directions, axis=1)[:, np.newaxis]
+        
+        # Add axis-aligned directions
+        for i in range(self.dim):
+            vec = np.zeros(self.dim)
+            vec[i] = 1
+            directions = np.vstack((directions, vec, -vec))
+        
+        # Find extreme points in each direction
+        for direction in directions:
+            result = linprog(-direction, A_ub=self.A, b_ub=self.b, method='highs')
+            if result.success:
+                vertex = result.x
+                # Check if this vertex is already in our list (up to tolerance)
+                is_new = all(np.linalg.norm(vertex - v) > self.tol for v in vertices)
+                if is_new:
+                    vertices.append(vertex)
+                    if len(vertices) > max_vertices:
+                        # Too many vertices, likely a numerical issue
+                        return None
+        
+        if not vertices:
+            # If no vertices found, try to find a single feasible point
+            point = self._find_feasible_point()
+            if point is not None:
+                return np.array([point])
+            return None
+        
+        return np.array(vertices)
     
-    def is_empty(self) -> bool:
-        """
-        Check if the polytope is empty.
-        
-        Returns:
-            True if empty, False otherwise
-        """
-        A,b = self.get_constraints()
-        return A.shape[0] > 0 and A.shape[1] == 0
-    
-    def contains(self, point: np.ndarray) -> bool:
-        """
-        Check if the polytope contains a point.
-        
-        Args:
-            point: Point to check
-            
-        Returns:
-            True if the polytope contains the point, False otherwise
-        """
-        return self.polytope.contains(point)
-    
-    def __eq__(self, other: 'Polytope') -> bool:
+    def __eq__(self, other: object) -> bool:
         """
         Check if two polytopes are equal.
         
-        Args:
-            other: Another polytope
+        Parameters:
+        -----------
+        other : object
+            Another object to compare with
             
         Returns:
-            True if equal, False otherwise
+        --------
+        bool
+            True if the polytopes are equal, False otherwise
         """
-        # This depends on the implementation in the base package
-        # A common approach is to check if both contain each other
-        return (self.polytope <= other.polytope) and (other.polytope <= self.polytope)
+        if not isinstance(other, Polytope):
+            return False
+            
+        if self.dim != other.dim:
+            return False
+            
+        # Check if one is a subset of the other and vice versa
+        return self.is_subset(other) and other.is_subset(self)
+    
+    def is_subset(self, other: 'Polytope') -> bool:
+        """
+        Check if this polytope is a subset of another polytope.
+        
+        Parameters:
+        -----------
+        other : Polytope
+            Another polytope to compare with
+            
+        Returns:
+        --------
+        bool
+            True if this polytope is a subset of the other, False otherwise
+        """
+        if self.dim != other.dim:
+            raise ValueError(f"Cannot compare polytopes of different dimensions: {self.dim} and {other.dim}")
+            
+        # A polytope P1 is a subset of P2 if and only if all vertices of P1 are in P2
+        # and all of P1's constraints are implied by P2's constraints
+        
+        # First, check if this polytope is empty
+        if self.is_empty():
+            return True  # Empty set is a subset of any set
+            
+        # Get vertices of this polytope
+        vertices = self.get_vertices()
+        if vertices is None:
+            # If we can't get vertices (e.g., unbounded polytope), use a more expensive approach
+            for i in range(other.A.shape[0]):
+                # For each constraint in other, check if it's redundant in the context of self
+                # Maximize other.A[i]·x - other.b[i] subject to self's constraints
+                c = -other.A[i]
+                try:
+                    result = linprog(c, A_ub=self.A, b_ub=self.b, method='highs')
+                    if result.success and -result.fun > other.b[i] + self.tol:
+                        # Found a point in self that violates a constraint in other
+                        return False
+                except:
+                    # If LP fails, conservatively say not a subset
+                    return False
+            return True
+                
+        # Check if all vertices of this polytope are contained in the other polytope
+        for vertex in vertices:
+            if not other.contains(vertex):
+                return False
+                
+        return True
     
     def volume(self) -> float:
         """
         Compute the volume of the polytope.
         
         Returns:
-            Volume of the polytope
+        --------
+        float
+            The volume of the polytope
         """
-        return self.polytope.volume
-    
-    def get_generators(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get the generators (vertices) of the polytope.
-        
-        Returns:
-            Tuple containing vertices and rays
-        """
-        # This depends on the implementation in the base package
-        return self.polytope.generators
-    
-    def get_constraints(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get the constraints (A, b) of the polytope.
-        
-        Returns:
-            Tuple of (A, b) representing the constraints Ax <= b
-        """
-        return self.polytope.A, self.polytope.b
+        # Get vertices of the polytope
+        vertices = self.get_vertices()
+        if vertices is None or len(vertices) <= self.dim:
+            return 0.0  # Unbounded or lower-dimensional polytope
+            
+        try:
+            # Compute convex hull to get a proper triangulation
+            hull = ConvexHull(vertices)
+            return hull.volume
+        except:
+            # If computation fails, return 0
+            warnings.warn("Volume computation failed")
+            return 0.0
     
     def __str__(self) -> str:
         """String representation of the polytope."""
-        return str(self.polytope)
+        if self.A.shape[0] == 0:
+            return f"Polytope(Dimension={self.dim}, Constraints=None)"
+        return f"Polytope(Dimension={self.dim}, Constraints={self.A.shape[0]})"
     
     def __repr__(self) -> str:
-        """Formal string representation of the polytope."""
-        return repr(self.polytope)
+        """Detailed representation of the polytope."""
+        return str(self)
