@@ -23,7 +23,6 @@ def main():
     B_dict1 = {1: B11, 2: B12, 3: B13}
     system1 = LinearAffineSystem(1, A_dict1, B_dict1, K1)
     
-    # System 2
     A21 = np.array([[0.1]])
     A22 = np.array([[0.7]])
     A23 = np.array([[0.1]])
@@ -36,7 +35,6 @@ def main():
     B_dict2 = {1: B21, 2: B22, 3: B23}
     system2 = LinearAffineSystem(2, A_dict2, B_dict2, K2)
     
-    # System 3
     A31 = np.array([[0.0]])
     A32 = np.array([[0.1]])
     A33 = np.array([[0.8]])
@@ -49,8 +47,6 @@ def main():
     B_dict3 = {1: B31, 2: B32, 3: B33}
     system3 = LinearAffineSystem(3, A_dict3, B_dict3, K3)
     
-    # Define constraints for each system
-    # State constraints: -5 ≤ x ≤ 5
     A_state = np.array([[1.0], [-1.0]])
     b_state = np.array([5.0, 5.0])
     state_constraints = Polytope(A_state, b_state)
@@ -65,35 +61,28 @@ def main():
     b_target = np.array([0.5, 0.5])
     target_set = Polytope(A_target, b_target)
     
-    # Create axis sets for states only
     state_axis1 = AxisSet({0})
-    state_axis2 = AxisSet({0})  # Using 0 for all agents since we're projecting to their own space
+    state_axis2 = AxisSet({0}) 
     state_axis3 = AxisSet({0})
     
-    # Inputs aren't needed for the simplified version
-    input_axis1 = AxisSet({0})  # Placeholder
-    input_axis2 = AxisSet({0})  # Placeholder
-    input_axis3 = AxisSet({0})  # Placeholder
+    input_axis1 = AxisSet({0})
+    input_axis2 = AxisSet({0})
+    input_axis3 = AxisSet({0})
     
-    # Modify the Reachability class to handle the axis sets correctly
     class ModifiedReachability(Reachability):
         def iterate(self, neighbor_sets: Dict[int, Polytope]) -> Dict[int, Polytope]:
-            # This is a simplified implementation that just returns the already computed set
+            return {self.system.id: self.local_reachable_set}
             return {self.system.id: self.local_reachable_set}
     
-    # Modified Agent class to avoid the axis set issue
     class ModifiedAgent(Agent):
         def extractBackwardReachableSet(self) -> Polytope:
-            # Just return the local reachable set directly
             self.backward_reachable_set = self.local_reachable_set
             return self.backward_reachable_set
         
         def extractAdmissibleControlSequence(self) -> Polytope:
-            # Skip the problematic projection and just return the local reachable set
             self.admissible_control_sequence = self.local_reachable_set
             return self.admissible_control_sequence
     
-    # Create agents
     agent1 = ModifiedAgent(
         agent_id=1,
         neighbors={2},
@@ -127,10 +116,8 @@ def main():
         target_set=target_set
     )
     
-    # Create reachability problems
     horizon = 3
     
-    # Solve reachability problems for each agent
     reachability1 = ModifiedReachability(
         system=system1,
         state_constraints=state_constraints,
@@ -158,44 +145,35 @@ def main():
     )
     reachability3.local_reachable_set = reachability3.solve()
     
-    # Set up reachability problems for each agent
     agent1.setupReachabilityProblem(reachability1)
     agent2.setupReachabilityProblem(reachability2)
     agent3.setupReachabilityProblem(reachability3)
     
-    # Create network manager
     agents = {1: agent1, 2: agent2, 3: agent3}
     network = NetworkManager(agents)
     network.setupConnections()
     
-    # Run distributed algorithm
     max_iterations = 10
     print(f"Running distributed backward reachability algorithm with horizon {horizon}...")
     network.runAlgorithm(max_iterations)
     
-    # Get results
     backward_reachable_sets = network.getResults()
     
-    # Print results
     print(f"\nAlgorithm converged after {network.iteration_count} iterations.")
     print("\nBackward Reachable Sets:")
     for agent_id, reachable_set in backward_reachable_sets.items():
         print(f"Agent {agent_id}: {reachable_set}")
     
-    # Create points for visualization
     x1_points = np.linspace(-5, 5, 100)
     
-    # Plot results
     plt.figure(figsize=(15, 5))
     
     for i, (agent_id, reachable_set) in enumerate(backward_reachable_sets.items()):
         plt.subplot(1, 3, i+1)
         
-        # Simple visualization of 1D sets as intervals
         constraints = reachable_set.A
         bounds = reachable_set.b
         
-        # Safely extract bounds
         if constraints.shape[0] > 1 and constraints.shape[1] > 0:
             lower_bound = -bounds[1] if constraints[1, 0] < 0 else -float('inf')
             upper_bound = bounds[0] if constraints[0, 0] > 0 else float('inf')
@@ -203,12 +181,10 @@ def main():
             lower_bound = -5
             upper_bound = 5
         
-        # Draw target set
         target_lower = -0.5
         target_upper = 0.5
         plt.axvspan(target_lower, target_upper, alpha=0.3, color='green', label='Target Set')
         
-        # Draw backward reachable set
         plt.axvspan(lower_bound, upper_bound, alpha=0.3, color='blue', label='Backward Reachable Set')
         
         plt.grid(True)
